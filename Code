@@ -1,0 +1,210 @@
+# ============================================================
+# ALS3200C Final Project
+# Sequence classification on microbiome DTA features
+# ============================================================
+
+import os
+import time
+import random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# ----------------------------
+# Global configuration
+# ----------------------------
+SEED = 827847
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+tf.get_logger().setLevel("ERROR")
+
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+# ----------------------------
+# Load and prepare data
+# ----------------------------
+data_url = "https://raw.githubusercontent.com/bryankolaczkowski/ALS3200C/main/mbiome.data.csv"
+dataframe = pd.read_csv(data_url)
+
+train_dataframe = dataframe.sample(frac=0.8, random_state=SEED)
+valid_dataframe = dataframe.drop(train_dataframe.index)
+
+dta_ids = [c for c in dataframe.columns if c.startswith("DTA")]
+train_x = train_dataframe[dta_ids].to_numpy().astype("float32")
+valid_x = valid_dataframe[dta_ids].to_numpy().astype("float32")
+
+loc = np.linspace(-2.5, 2.5, train_x.shape[1]).astype("float32")
+train_x = np.stack([train_x, np.array([loc]*train_x.shape[0])], axis=-1)
+valid_x = np.stack([valid_x, np.array([loc]*valid_x.shape[0])], axis=-1)
+
+train_y = train_dataframe["LBL0"].to_numpy().astype("float32")
+valid_y = valid_dataframe["LBL0"].to_numpy().astype("float32")
+
+SEQ_LEN = train_x.shape[1]
+FEAT_DIM = train_x.shape[2]
+
+# ----------------------------
+# tf.data pipeline
+# ----------------------------
+AUTOTUNE = tf.data.AUTOTUNE
+
+def make_dataset(x, y, batch=256, shuffle=False):
+    ds = tf.data.Dataset.from_tensor_slices((x, y))
+    if shuffle:
+        ds = ds.shuffle(min(len(x), 4096), seed=SEED)
+    ds = ds.batch(batch)
+    ds = ds.cache()
+    ds = ds.prefetch(AUTOTUNE)
+    return ds
+
+train_data = make_dataset(train_x, train_y, batch=256, shuffle=True)
+valid_data = make_dataset(valid_x, valid_y, batch=256)
+
+# ----------------------------
+# Metrics and utilities
+# ----------------------------
+def get_metrics():
+    return [
+        keras.metrics.BinaryAccuracy(name="accuracy"),
+        keras.metrics.AUC(name="auc"),
+        keras.metrics.Precision(name="precision"),
+        keras.metrics.Recall(name="recall"),
+    ]
+
+def compile_model(model, lr=1e-3):
+    model.compile(
+        optimizer=keras.optimizers.Adam(lr),
+        loss="binary_crossentropy",
+        metrics=get_metrics(),
+    )
+    return model
+
+def train_and_evaluate(model, epochs=40, patience=6):
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor="val_auc",
+        mode="max",
+        patience=patience,
+        restore_best_weights=True
+    )
+    start = time.time()
+    history = model.fit(
+        train_data,
+        validation_data=valid_data,
+        epochs=epochs,
+        callbacks=[early_stop],
+        verbose=1
+    )
+    elapsed = time.time() - start
+    results = model.evaluate(valid_data, verbose=0)
+    return history, dict(zip(model.metrics_names, results)), elapsed / len(history.history["loss"])
+
+# ----------------------------
+# Model definitions
+# ----------------------------
+def transformer_block(x, d_model, heads, ff_mult, dropout):
+    attn = layers.MultiHeadAttention(num_heads=heads, key_dim=d_model // heads)(x, x)
+    x = layers.Add()([x, attn])
+    x = layers.LayerNormalization()(x)
+
+    ff = layers.Dense(d_model * ff_mult, activation="relu")(x)
+    ff = layers.Dense(d_model)(ff)
+    x = layers.Add()([x, ff])
+    x = layers.LayerNormalization()(x)
+    return x
+
+def build_transformer(d_model=32, heads=2, blocks=1, ff_mult=2, dropout=0.1):
+    inputs = keras.Input(shape=(SEQ_LEN, FEAT_DIM))
+    x = layers.Dense(d_model)(inputs)
+
+    for _ in range(blocks):
+        x = transformer_block(x, d_model, heads, ff_mult, dropout)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+
+    model = keras.Model(inputs, outputs)
+    return compile_model(model)
+
+def build_conv1d(use_projection=False, d_model=32):
+    inputs = keras.Input(shape=(SEQ_LEN, FEAT_DIM))
+    x = inputs
+
+    if use_projection:
+        x = layers.Dense(d_model)(x)
+
+    x = layers.Conv1D(32, 3, padding="same", activation="relu")(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+
+    model = keras.Model(inputs, outputs)
+    return compile_model(model)
+
+def build_lstm(use_projection=False, d_model=32):
+    inputs = keras.Input(shape=(SEQ_LEN, FEAT_DIM))
+    x = inputs
+
+    if use_projection:
+        x = layers.Dense(d_model)(x)
+
+    x = layers.LSTM(32)(x)
+    x = layers.Dense(64, activation="relu")(x)
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+
+    model = keras.Model(inputs, outputs)
+    return compile_model(model)
+
+# ----------------------------
+# Experiments
+# ----------------------------
+experiments = []
+
+# Transformer baseline
+model = build_transformer()
+_, res, sec = train_and_evaluate(model)
+experiments.append(("Transformer", model.count_params(), sec, res))
+
+# Conv1D baseline
+model = build_conv1d(use_projection=False)
+_, res, sec = train_and_evaluate(model)
+experiments.append(("Conv1D", model.count_params(), sec, res))
+
+# Conv1D + projection
+model = build_conv1d(use_projection=True)
+_, res, sec = train_and_evaluate(model)
+experiments.append(("Conv1D + projection", model.count_params(), sec, res))
+
+# LSTM baseline
+model = build_lstm(use_projection=False)
+_, res, sec = train_and_evaluate(model, epochs=30)
+experiments.append(("LSTM", model.count_params(), sec, res))
+
+# LSTM + projection
+model = build_lstm(use_projection=True)
+_, res, sec = train_and_evaluate(model, epochs=30)
+experiments.append(("LSTM + projection", model.count_params(), sec, res))
+
+# ----------------------------
+# Results summary
+# ----------------------------
+summary = pd.DataFrame([
+    {
+        "model": name,
+        "params": params,
+        "sec_per_epoch": sec,
+        **metrics
+    }
+    for name, params, sec, metrics in experiments
+]).sort_values("auc", ascending=False)
+
+summary
